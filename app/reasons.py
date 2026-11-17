@@ -135,6 +135,16 @@ REASONS = {
     "C_STALE_BATCH": _r(
         "C_STALE_BATCH", ERROR, "batches",
         "输入最大 event_time 低于已持久化水位，按陈旧批次拒绝", "确认导出端时钟与文件版本"),
+    "B_RERUN_IN_PROGRESS": _r(
+        "B_RERUN_IN_PROGRESS", WARN, "batches",
+        "同一批次键已有运行中的重算，拒绝并发重算", "等当前重算结束后再重试，避免重复累计"),
+    "B_BASELINE_KEPT": _r(
+        "B_BASELINE_KEPT", INFO, "batches",
+        "重算失败，发布基线与旧结果保持不变，页面与导出继续用旧版",
+        "修复输入后按同一批次键重试，attempts 只累加不新增行"),
+    "B_BASELINE_PUBLISHED": _r(
+        "B_BASELINE_PUBLISHED", INFO, "batches",
+        "重算完成，结果与发布基线在同一事务切换", "切换前的查询全部命中旧版，切换后统一新版"),
     # ---- M7 导出 ----
     "X_EMPTY_SELECTION": _r(
         "X_EMPTY_SELECTION", WARN, "export",

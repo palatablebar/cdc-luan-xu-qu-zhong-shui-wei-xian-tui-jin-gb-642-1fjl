@@ -21,9 +21,11 @@ DATASETS = {
 
 
 def _batch(store, batch_id: str | None) -> dict:
-    batch = store.get_batch(batch_id) if batch_id else store.latest_batch()
-    if batch is None:
-        raise errors.NotFound("还没有批次，先采信一次", code="E_NO_BATCH")
+    # 导出与页面共用同一个发布基线，杜绝「页面新总量、导出旧记录」的撕裂。
+    batch = store.get_batch(batch_id) if batch_id else store.active_batch()
+    if batch is None or batch.get("status") != "done":
+        raise errors.NotFound("还没有已发布的基线批次，先采信一次",
+                              code="E_NO_BATCH")
     return batch
 
 

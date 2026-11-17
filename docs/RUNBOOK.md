@@ -46,6 +46,8 @@ curl -s -o /tmp/manifest.json   "$BASE/api/export/manifest.json"
 | 隔离区大量同名行 | `E_COLUMN_COUNT` / `E_BAD_JSON` | 导出端截断或多分隔符，重新导出 |
 | 冲突表出现同键同版本 | `C_VERSION_CONFLICT` | 两条都不应用，回源确认版本号 |
 | 导入报 409 | `C_STALE_BATCH` | 拿到的是旧导出，重新导出后再跑 |
+| 重算报 409 | `B_RERUN_IN_PROGRESS` | 同一批次键已有重算在跑，等其结束再试；并发重算不会累计 |
+| 重算后页面还是旧数字 | `B_BASELINE_KEPT`（语义） | 重算失败，基线未切换；看 `/batches` 重算尝试的失败原因，修复后同键重试 |
 | 快照键比预期少 | `W_PENDING_WINDOW` | 事件落在水位之后，等下一轮水位推过 |
 | 水位不前进 | `W_WATERMARK_REGRESS` | 检查导出端时钟与文件版本 |
 
@@ -73,3 +75,43 @@ python -m pytest -q
 - `conflicts.csv`：3 行，含两条证据行引用；
 - `snapshot.csv` / `snapshot.json`：18 键，活跃 16、墓碑 2；
 - `manifest.json`：`run_id`、每个输入的 sha256、阶段耗时、四账。
+
+## 7 深夜重算与发布基线（不停止查询）
+
+**裁决：重算期间不停止查询，新旧结果各自完整后由「发布基线」单点原子切换，
+页面与导出全程共用同一个基准版本。**
+
+读路径只认 `baseline` 表（单行）指向的 `status='done'` 批次；重算过程不写业务结果行，
+只在 `run_attempts` 留一条运行痕迹。因此：
+
+| 时刻 | 页面 / 导出 | 顶栏 |
+|---|---|---|
+| 重算进行中 | 仍是旧基线版本，数字与导出文件名里的批次号一致 | 黄色「重算中」，提示当前仍用旧基线 |
+| 重算成功提交 | 结果落库与基线切换在**同一事务**，提交后统一指向新版本 | 提示消失，基线批次号更新 |
+| 重算失败 | 基线与旧结果原样保留，一行不丢；`run_attempts` 留 `failed` 与错误原因 | 提示消失，继续展示旧基线 |
+
+值班核对命令：
+
+```bash
+# 对外版本（页面和所有 /api/export/* 都取这个 batch_id）
+curl -s $BASE/api/health | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+  print(d["batch_id"], d["baseline_published_at"], "recalc=", d["recalculating"])'
+
+# 重算尝试历史：同批次键的重试只有一行，attempts 累加，不新增、不重复累计
+curl -s $BASE/api/batches | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["attempts"], ensure_ascii=False))'
+
+# 导出文件名自带基线批次号，可直接和页面顶栏的「发布基线」对账
+curl -s -D - -o /dev/null $BASE/api/export/snapshot.csv | grep -i content-disposition
+```
+
+规则细节：
+
+- 同一 `batch_key` 已有 `running` 重算时，再触发返回 409 `B_RERUN_IN_PROGRESS`，
+  拒绝并发重算，避免重复累计；
+- 失败后按**同一批次键**重试：复用同一 `run_attempts` 行，`attempts + 1`，
+  不产生新批次、不写半成品结果；不同批次键才是独立的新版本；
+- 同一输入重跑命中已完成批次 → 幂等重放（`B_IDEMPOTENT_REPLAY`），
+  不登记重算尝试、不动基线、不新增行；
+- 老库升级（无 `baseline` 行）读路径自动回退到最新 `done` 批次，页面不空；
+  下一次成功采信会在同事务补上基线行。
+

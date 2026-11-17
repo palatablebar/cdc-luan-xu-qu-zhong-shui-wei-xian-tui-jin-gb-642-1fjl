@@ -13,7 +13,12 @@ router = APIRouter(tags=["M6 批次续跑"])
 @router.get("/api/batches")
 def api_batches(limit: int = 30, ctx: Ctx = Depends(get_ctx)) -> dict:
     rows = history.rows(ctx.store, limit=max(1, min(limit, 100)))
+    active_id = ctx.store.active_batch_id()
     return {"count": len(rows), "batches": rows,
+            "active_batch_id": active_id,
+            "recalculating": bool(ctx.store.running_attempts()),
+            "running_attempts": ctx.store.running_attempts(),
+            "attempts": ctx.store.latest_attempts(limit=max(1, min(limit, 100))),
             "stored_watermark": state.stored_watermark(ctx.store)}
 
 
@@ -64,10 +69,15 @@ def api_resume(batch_id: str, ctx: Ctx = Depends(get_ctx)) -> dict:
 def page_batches(request: Request, ctx: Ctx = Depends(get_ctx)):
     batch = ctx.current_batch()
     rows = history.rows(ctx.store, limit=20)
+    active_id = ctx.store.active_batch_id()
+    for row in rows:
+        row["is_baseline"] = row["batch_id"] == active_id
     totals = ctx.store.load_totals(batch["batch_id"]) if batch else {}
     stages = ctx.store.load_stages(batch["batch_id"]) if batch else []
     return render(request, "batches.html", batch=batch, page="batches",
                   batches=rows, totals=totals, stages=stages,
+                  active_batch_id=active_id,
+                  attempts=ctx.store.latest_attempts(limit=10),
                   stored_watermark=state.stored_watermark(ctx.store),
                   plan=resume.plan(ctx.store, batch["batch_id"]) if batch else {},
                   manifest=(ctx.store.load_manifest(batch["batch_id"])

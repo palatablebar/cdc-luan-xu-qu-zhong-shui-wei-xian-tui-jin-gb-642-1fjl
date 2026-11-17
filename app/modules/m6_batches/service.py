@@ -62,8 +62,16 @@ def _ms(start: float) -> int:
 
 def run(*, settings, store, source: str = "all", params: dict | None = None,
         resume_of: str | None = None) -> dict:
+    """一次采信/重算的对外入口。
+
+    版本可见性规则（深夜重算期间页面与导出始终一致）：
+
+    - 命中已完成批次键 → 幂等重放，不重算、不新增行、不动基线；
+    - 新批次键 → 先登记 run_attempt（running），重算全程只读旧基线；
+      成功时结果与基线切换在同一事务提交，失败只把 attempt 标 failed，
+      基线与旧结果原样保留，页面和导出继续用旧版。
+    """
     started_at = _now_iso()
-    clock = time.perf_counter()
     run_id = manifest_mod.new_run_id()
     params = state.normalize_params(params)
     stages: list[dict] = []
@@ -83,6 +91,40 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
     replay = resume.replay_of(store, key)
     if replay is not None:
         return _replay_payload(store, replay, key, run_id, stages)
+
+    # 只有「相对已发布基线的重算」才登记运行尝试：首次采信无基线可守，
+    # 直接落库发布；幂等重放在上面已返回，不会走到这里。
+    active = store.active_batch()
+    is_recalc = active is not None and active["batch_id"] != batch_id
+    if is_recalc:
+        # 同一 batch_key 已有 running 重算会在此 409，杜绝并发重复累计；
+        # failed 后的同键重试只累加 attempts，不新增行。
+        store.start_attempt(batch_key=key, batch_id=batch_id, run_id=run_id,
+                            started_at=started_at, note=_batch_note(resume_of, 0))
+    try:
+        result = _compute(
+            settings=settings, store=store, bundle=bundle, key=key, batch_id=batch_id,
+            run_id=run_id, started_at=started_at, stages=stages, params=params,
+            resume_of=resume_of)
+    except Exception as exc:
+        if is_recalc:
+            # 重算失败：只留审计痕迹，绝不触碰基线与任何已发布批次的结果行。
+            store.finish_attempt(
+                batch_key=key, status="failed", finished_at=_now_iso(),
+                error=f"{type(exc).__name__}: {exc}")
+        raise
+    if is_recalc:
+        store.finish_attempt(batch_key=key, status="done",
+                             finished_at=result["batch"]["finished_at"])
+    return result
+
+
+def _compute(*, settings, store, bundle, key: str, batch_id: str, run_id: str,
+             started_at: str, stages: list[dict], params: dict,
+             resume_of: str | None) -> dict:
+    """M2→M7 的纯重算与落库；成功在同一事务发布新基线，失败整体回滚。"""
+    clock = time.perf_counter()
+    counts = bundle.counters
 
     # ---- M2 契约 ----
     step = time.perf_counter()
@@ -192,13 +234,14 @@ def run(*, settings, store, source: str = "all", params: dict | None = None,
 
     snapshot_rows = [{**row, "amount": None if row["amount"] is None else str(row["amount"])}
                      for row in snapshot.rows]
+    # 结果落库与基线切换在同一事务：提交前对外仍是旧基线，提交后整体切到新版。
     store.save_run(
         batch=batch,
         inputs=[_input_row(f) for f in bundle.files],
         events=[n.to_row() for n in classified.all_rows],
         snapshots=snapshot_rows,
         watermarks=wm_mod.series_rows(marks, iso),
-        stages=stages, totals=totals, manifest=doc)
+        stages=stages, totals=totals, manifest=doc, published_at=finished_at)
 
     return {
         "status": "done",

@@ -44,9 +44,17 @@ class Ctx:
     store: object
 
     def current_batch(self, batch_id: str | None = None) -> dict | None:
+        """页面/导出共用的当前批次 = 发布基线。
+
+        显式 batch_id 只用于查看某个已完成的历史批次；默认始终返回基线，
+        保证重算期间页面不会先读到半成品的新总量。
+        """
         if batch_id:
-            return self.store.get_batch(batch_id)
-        return self.store.latest_batch()
+            batch = self.store.get_batch(batch_id)
+            if batch is not None and batch.get("status") == "done":
+                return batch
+            return None
+        return self.store.active_batch()
 
     def layers(self, batch_id: str) -> dict:
         """一次取齐页面需要的只读数据，避免每页各写一套查询。"""
@@ -128,6 +136,9 @@ def render(request: Request, name: str, **context):
     batch = context.pop("batch", None)
     if batch is None:
         batch = ctx.current_batch(context.get("batch_id"))
+    # 每次渲染实时读取：重算中全页顶栏统一提示，基线版本号各页一致。
+    running = ctx.store.running_attempts()
+    baseline_row = ctx.store.baseline_row()
     base = {
         "request": request,
         "ctx": ctx,
@@ -135,6 +146,9 @@ def render(request: Request, name: str, **context):
         "batch": batch,
         "rule_version": ctx.settings.rule_version,
         "print_ts": now_local().strftime("%Y-%m-%d %H:%M"),
+        "running_attempts": running,
+        "recalculating": bool(running),
+        "baseline_published_at": baseline_row.get("published_at") if baseline_row else None,
     }
     base.update(context)
     return request.app.state.templates.TemplateResponse(

@@ -54,17 +54,26 @@ def create_app(settings: config.Settings | None = None,
     @app.get("/api/health", include_in_schema=False)
     def health() -> dict:
         store = app.state.store
-        batch = store.latest_batch()
+        batch = store.active_batch()
         totals = store.load_totals(batch["batch_id"]) if batch else {}
+        running = store.running_attempts()
         return {
             "status": "ok",
             "rule_version": settings.rule_version,
             "late_window_minutes": settings.late_window_minutes,
             "batch_id": batch["batch_id"] if batch else None,
+            "run_id": batch["run_id"] if batch else None,
+            "baseline_published_at": (store.baseline_row() or {}).get("published_at"),
             "watermark_utc": batch.get("watermark_utc") if batch else None,
             "events": int(totals.get("raw_lines", 0) or 0),
             "applied": int(totals.get("applied", 0) or 0),
             "snapshot_keys": int(totals.get("snapshot_keys", 0) or 0),
+            # 重算进行中时值班同事能直接看到：对外仍是基线版本，未完成版本不可见。
+            "recalculating": bool(running),
+            "running_attempts": [
+                {"batch_key": r["batch_key"], "batch_id": r["batch_id"],
+                 "run_id": r["run_id"], "started_at": r["started_at"]}
+                for r in running],
         }
 
     @app.exception_handler(KeyError)

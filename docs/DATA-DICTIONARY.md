@@ -91,3 +91,19 @@
 `watermark_utc`、`max_event_time_utc`、`stages[]`、`counters`、`reconcile`。
 
 同一 `input_digest` 重跑命中同一 `batch_key`，返回原批次、不新增行。
+
+## 10 发布基线与重算尝试
+
+**发布基线 `baseline`（单行，`id` 恒为 1）**：`batch_id` + `published_at`。只有 `status='done'`
+的完整批次能被指向；结果落库与基线写入在同一事务，读路径（页面、`/api/*`、`/api/export/*`、
+`/api/health`）只认这一行。重算提交前对外是旧版，提交后整体切到新版，不存在跨版本撕裂。
+
+**重算尝试 `run_attempts`（按 `batch_key` 一行）**：`batch_id/run_id/status(running|done|failed)/
+started_at/finished_at/attempts/last_error/note`。它只承载运行痕迹，不写任何业务结果行：
+
+- 同一 `batch_key` 已有 `running` → 新请求 409 `B_RERUN_IN_PROGRESS`；
+- `failed` 后同键重试 → 同一行 `attempts + 1`、状态回 `running`，不新增批次、不重复累计；
+- 重算失败 → 基线与已发布结果原样保留（原因码 `B_BASELINE_KEPT` 语义）；
+- 首次采信与幂等重放不登记重算尝试。
+
+老库没有 `baseline` 行时，读路径回退到最新 `done` 批次，下一次成功采信自动补写。

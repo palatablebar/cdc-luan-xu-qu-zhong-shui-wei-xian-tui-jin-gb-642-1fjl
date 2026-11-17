@@ -1,6 +1,6 @@
 # 深度登记 cdcwater（CDC 乱序去重与水位线推进）
 
-- 规模：中型（7 个功能模块 / 7 个页面 / 79 条测试）
+- 规模：中型（7 个功能模块 / 7 个页面 / 89 条测试）
 - 核心规则一：**版本序折叠 + 墓碑**——每个 `(table, pk)` 按 `version` 升序应用，`delete` 写墓碑；
   同键同版本出现两种内容整组不应用（`C_VERSION_CONFLICT`），删除之后到达的低版本 upsert
   不复活（`C_TOMBSTONE_RESURRECT`），删除之前到达的低版本照常应用后被覆盖。
@@ -24,7 +24,8 @@
 | M7 审计导出 | 下载证据行、隔离、冲突、快照与清单 | GET /api/export/* | `app/modules/m7_export/csv_out.py` `app/modules/m7_export/json_out.py` `app/modules/m7_export/manifest_out.py` `app/modules/m7_export/service.py` | `tests/test_m7_export.py` |
 
 端到端：`tests/test_e2e.py` 覆盖「样例 → 采信 → 归一 → 去重冲突 → 水位 → 快照 → 导出 → 页面」，
-含 4xx 失败输入与幂等重跑；`tests/test_invariants.py` 覆盖行账、键账、金额、幂等、迟到互补。
+含 4xx 失败输入与幂等重跑；`tests/test_invariants.py` 覆盖行账、键账、金额、幂等、迟到互补；
+`tests/test_baseline.py` 覆盖发布基线的原子切换、失败保留旧版、重试不累计与并发拦截。
 
 ## 陷阱登记
 
@@ -41,6 +42,8 @@
 | TRAP-19 | 一条事件同时像「重复」又像「冲突」，坏行还互相重复 | 按代码书写顺序覆盖，结果随遍历顺序变 | 优先级 `quarantine > conflict > duplicate > apply`，各桶由集合运算得出 | `app/modules/m3_dedup/service.py` | `tests/test_m3_dedup.py::test_conflict_beats_duplicate`、`tests/test_m3_dedup.py::test_priority_independent_of_input_order` |
 | TRAP-23 | 事件 `event_time` 恰好等于水位线 / 恰好等于 `as_of` | 两端都算，重复计入或漏计 | 迟到用半开 `[水位线, +inf)`；快照含 `as_of`、待定窗口 `(as_of, +inf)` 半开 | `app/modules/m4_watermark/watermark.py`、`app/modules/m5_snapshot/materialize.py` | `tests/test_m4_watermark.py::test_boundary_equal_watermark_is_not_late`、`tests/test_m5_snapshot.py::test_boundary_event_at_as_of_included_once` |
 | TRAP-26 | 拿上一轮旧导出再跑一次（最大事件 06:00 < 已持久化水位 08:52） | 无条件覆盖，水位回退、快照变旧 | 陈旧批次直接 409 `C_STALE_BATCH`，已落库结果不动 | `app/modules/m6_batches/resume.py`、`app/modules/m6_batches/state.py` | `tests/test_m6_batches.py::test_stale_input_rejected` |
+| TRAP-27 | 深夜重算一开始页面先露出新总量，导出还带旧记录，前后对不上；重算失败还可能丢旧版 | 停掉查询（值班没法查），或让读路径直接读最新批次（半成品被看见、失败后无版本可用） | 不停查询；`baseline` 单行指针只在结果落库的同一切换，读路径（页面/导出/健康检查）只认它；失败只写 `run_attempts(failed)`，基线与旧结果不动 | `app/store.py`、`app/modules/m6_batches/service.py`、`app/web.py`、`app/modules/m7_export/service.py` | `tests/test_baseline.py`（10 条） |
+| TRAP-28 | 同一批重算被反复重试，每次都新增一批行 / 计数被重复累计 | 每次重试新建批次与结果行，数字越加越大 | 重试按 `batch_key` 复用同一 `run_attempts` 行（`attempts` 累加），同键并发 `running` 直接 409 `B_RERUN_IN_PROGRESS`；成功才落一个业务批次 | `app/store.py`、`app/modules/m6_batches/service.py` | `tests/test_baseline.py::test_retry_same_key_accumulates_attempts_without_new_rows`、`tests/test_baseline.py::test_concurrent_rerun_same_key_rejected` |
 
 ## 对账规则
 
@@ -68,7 +71,10 @@
   - `tests/test_invariants.py::test_amount_conservation_is_exact`（金额守恒，Decimal 精确）；
   - `tests/test_invariants.py::test_idempotent_rerun_keeps_rows_and_totals`（幂等重跑）；
   - `tests/test_m4_watermark.py::test_watermark_monotonic`（水位单调）；
-  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）。
+  - `tests/test_m5_snapshot.py::test_rebuild_is_idempotent`（物化可重复）；
+  - `tests/test_baseline.py::test_failed_recalc_keeps_old_baseline_and_rows`（重算失败旧版不丢）；
+  - `tests/test_baseline.py::test_retry_same_key_accumulates_attempts_without_new_rows`（重试不累计）；
+  - `tests/test_baseline.py::test_page_and_export_share_baseline_during_and_after_recalc`（页面与导出同基线）。
 
 ## 已知不覆盖
 

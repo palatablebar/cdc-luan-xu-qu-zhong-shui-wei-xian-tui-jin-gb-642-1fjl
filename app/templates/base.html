@@ -13,8 +13,18 @@
 
 <header class="masthead">
   <p class="mark">cdcwater</p>
+  {% if recalculating %}
+  <p class="rerun-banner" role="status">
+    <span class="state state-pending">重算中</span>
+    正在重算
+    {% for r in running_attempts %}<code>{{ r.batch_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}
+    ；页面与导出仍统一使用已发布基线
+    <code>{{ batch.batch_id if batch else '—' }}</code>，新结果完整发布前不会出现。
+  </p>
+  {% endif %}
   <dl class="metaline">
-    <div><dt>批次</dt><dd>{{ batch.batch_id if batch else '未运行' }}</dd></div>
+    <div><dt>发布基线</dt><dd><span class="state state-active">基线</span> {{ batch.batch_id if batch else '未发布' }}</dd></div>
+    <div><dt>运行号</dt><dd class="mono">{{ batch.run_id if batch else '—' }}</dd></div>
     <div><dt>水位</dt><dd>{{ batch.watermark_utc | localdt if batch else '—' }}</dd></div>
     <div><dt>窗口</dt><dd>{{ late_window }} 分钟</dd></div>
     <div><dt>规则</dt><dd>{{ rule_version }}</dd></div>

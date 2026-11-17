@@ -5,7 +5,10 @@
 - 金额列一律 TEXT（Decimal 字符串），不落 float；主键 pk 一律 TEXT，前导零与
   超过 2^53 的整数都按原样保存；
 - 一次运行的所有行在同一个事务里「先删后插」，失败整体回滚，不留半批数据；
-- 页面永远只展示一个批次，所有查询都带 batch_id。
+- 页面与导出只认 baseline 表里的发布基线（active 批次），重算期间基线不动，
+  因此页面与导出永远是同一份完整版本；重算失败时基线继续指向旧版，不丢数据；
+- 重算过程只在 run_attempts 留运行痕迹（running/failed），不写业务结果行，
+  同一批次键的重试复用同一 attempt 行，不新增、不重复累计。
 """
 from __future__ import annotations
 
@@ -71,6 +74,27 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+-- 发布基线：单行（id 恒为 1）。只有 status='done' 的完整批次才能成为基线，
+-- 切换与结果落库在同一事务内完成，读路径（页面/导出）只认这一行。
+CREATE TABLE IF NOT EXISTS baseline (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    batch_id TEXT NOT NULL,
+    published_at TEXT NOT NULL,
+    FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
+);
+-- 重算尝试：运行痕迹与业务结果分离。同一 batch_key 的多次重试复用同一行，
+-- running 时唯一，用于并发拦截；failed 只留审计，绝不触碰基线与结果表。
+CREATE TABLE IF NOT EXISTS run_attempts (
+    batch_key TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -118,13 +142,115 @@ class Store:
         return rows[0] if rows else None
 
     def latest_batch(self, status: str = "done") -> dict | None:
+        """最新批次。注意：这是历史视角，读路径请用 active_batch()。
+
+        只返回指定状态的批次（默认 done）；没有完成批次时返回 None，
+        绝不把 running/failed 的半成品批次暴露给页面与导出。
+        """
         rows = self._all(
             "SELECT * FROM batches WHERE status=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (status,))
-        if not rows:
-            rows = self._all("SELECT * FROM batches ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                             ())
         return rows[0] if rows else None
+
+    # ---------- 发布基线（页面与导出共用的唯一基准版本） ----------
+    def active_batch(self) -> dict | None:
+        """当前对外基线：baseline 指向的已完成批次。
+
+        老库（升级前已落库、还没有 baseline 行）回退到最新的 done 批次，
+        保证升级瞬间页面不空；首次有新批次落库时会在同一事务里写入基线。
+        """
+        rows = self._all(
+            """SELECT b.* FROM baseline bl
+               JOIN batches b ON b.batch_id = bl.batch_id
+               WHERE bl.id = 1 AND b.status = 'done'""", ())
+        if rows:
+            return rows[0]
+        return self.latest_batch("done")
+
+    def active_batch_id(self) -> str | None:
+        batch = self.active_batch()
+        return batch["batch_id"] if batch else None
+
+    def baseline_row(self) -> dict | None:
+        rows = self._all("SELECT * FROM baseline WHERE id = 1", ())
+        return rows[0] if rows else None
+
+    def publish_baseline(self, conn, batch_id: str, published_at: str) -> None:
+        """在调用方事务内把基线指向新完成批次（单点原子切换）。"""
+        conn.execute(
+            """INSERT INTO baseline (id, batch_id, published_at) VALUES (1, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 batch_id = excluded.batch_id,
+                 published_at = excluded.published_at""",
+            (batch_id, published_at))
+
+    # ---------- 重算尝试（运行痕迹，不碰业务结果） ----------
+    def start_attempt(self, *, batch_key: str, batch_id: str, run_id: str,
+                      started_at: str, note: str = "") -> dict:
+        """登记一次重算尝试。
+
+        同一 batch_key 已有 running 尝试 → 409，拒绝并发重算；
+        已 failed 的同键重试：attempts + 1、状态回 running，不新增行。
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_attempts WHERE batch_key=?", (batch_key,)
+            ).fetchone()
+            if row is not None and row["status"] == "running":
+                # 自愈：结果已落库但尝试标记没来得及收尾（进程崩溃），
+                # 视为上一轮已完成，允许新一轮登记，而不是死锁在 running。
+                done = conn.execute(
+                    "SELECT 1 FROM batches WHERE batch_id=? AND status='done'",
+                    (row["batch_id"],)).fetchone()
+                if done is not None:
+                    conn.execute(
+                        "UPDATE run_attempts SET status='done', finished_at=? "
+                        "WHERE batch_key=?", (started_at, batch_key))
+                    row = None
+            if row is not None and row["status"] == "running":
+                from .errors import Conflict
+                raise Conflict(
+                    f"批次键 {batch_key} 已有运行中的重算（{row['run_id']}），"
+                    "请等其结束后再试",
+                    code="B_RERUN_IN_PROGRESS",
+                    detail={"batch_key": batch_key, "run_id": row["run_id"]})
+            if row is None:
+                conn.execute(
+                    """INSERT INTO run_attempts (batch_key,batch_id,run_id,status,
+                          started_at,attempts,note)
+                       VALUES (?,?,?,'running',?,1,?)""",
+                    (batch_key, batch_id, run_id, started_at, note))
+                attempts = 1
+            else:
+                attempts = row["attempts"] + 1
+                conn.execute(
+                    """UPDATE run_attempts SET batch_id=?, run_id=?, status='running',
+                          started_at=?, finished_at=NULL, attempts=?,
+                          last_error='', note=? WHERE batch_key=?""",
+                    (batch_id, run_id, started_at, attempts, note, batch_key))
+        return {"batch_key": batch_key, "batch_id": batch_id, "run_id": run_id,
+                "attempts": attempts}
+
+    def finish_attempt(self, *, batch_key: str, status: str, finished_at: str,
+                       error: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE run_attempts SET status=?, finished_at=?, last_error=?
+                   WHERE batch_key=?""",
+                (status, finished_at, error, batch_key))
+
+    def get_attempt(self, batch_key: str) -> dict | None:
+        rows = self._all(
+            "SELECT * FROM run_attempts WHERE batch_key=?", (batch_key,))
+        return rows[0] if rows else None
+
+    def running_attempts(self) -> list[dict]:
+        return self._all(
+            "SELECT * FROM run_attempts WHERE status='running' ORDER BY started_at", ())
+
+    def latest_attempts(self, limit: int = 10) -> list[dict]:
+        return self._all(
+            "SELECT * FROM run_attempts ORDER BY started_at DESC LIMIT ?", (limit,))
 
     def list_batches(self, limit: int = 30) -> list[dict]:
         return self._all(
@@ -136,10 +262,10 @@ class Store:
             "AND watermark_utc IS NOT NULL ORDER BY watermark_utc DESC LIMIT 1", ())
         return rows[0]["watermark_utc"] if rows else None
 
-    # ---------- 一次运行落库（单事务替换） ----------
+    # ---------- 一次运行落库（单事务替换 + 同事务发布基线） ----------
     def save_run(self, *, batch: dict, inputs: list[dict], events: list[dict],
                  snapshots: list[dict], watermarks: list[dict], stages: list[dict],
-                 totals: dict, manifest: dict) -> None:
+                 totals: dict, manifest: dict, published_at: str) -> None:
         with self.connect() as conn:
             for table in ("inputs", "events", "snapshots", "watermarks", "stages", "totals"):
                 conn.execute(f"DELETE FROM {table} WHERE batch_id=?", (batch["batch_id"],))
@@ -214,6 +340,9 @@ class Store:
                  batch.get("max_event_time"),
                  json.dumps(batch.get("params", {}), ensure_ascii=False),
                  batch.get("note", ""), batch.get("replay_of")))
+            # 结果全部落库成功后，才在同一事务切换基线；事务失败则整体回滚，
+            # 旧基线与旧结果原封不动，页面/导出不会读到半成品。
+            self.publish_baseline(conn, batch["batch_id"], published_at)
 
 
     # ---------- 快照（可重复物化） ----------

@@ -25,8 +25,11 @@
         </thead>
         <tbody>
           {% for row in batches %}
-          <tr class="{% if batch and row.batch_id == batch.batch_id %}{% else %}is-dim{% endif %}">
-            <td class="mono">{{ row.batch_id }}</td>
+          <tr class="{% if row.is_baseline %}{% else %}is-dim{% endif %}">
+            <td class="mono">
+              {{ row.batch_id }}
+              {% if row.is_baseline %}<span class="state state-active" title="页面与导出共用的发布基线">基线</span>{% endif %}
+            </td>
             <td class="mono ellipsis" title="{{ row.run_id }}">{{ row.run_id | masked(18) }}</td>
             <td>{{ row.source }}</td>
             <td class="mono nowrap">{{ row.watermark_utc | localdt }}</td>
@@ -133,8 +136,37 @@
 
 <section class="panel">
   <div class="panel-head">
+    <h2>重算尝试</h2>
+    <p class="panel-sub">运行痕迹与业务结果分离：失败只留记录，发布基线不动；同键重试复用一行、attempts 累加</p>
+  </div>
+  <div class="panel-body tight">
+    <div class="table-wrap">
+      <table class="grid">
+        <thead><tr><th>批次键</th><th>批次</th><th>最新运行号</th><th>状态</th><th class="num">重试</th><th>开始</th><th>结束</th><th>失败原因</th></tr></thead>
+        <tbody>
+          {% for a in attempts %}
+          <tr>
+            <td class="mono">{{ a.batch_key }}</td>
+            <td class="mono">{{ a.batch_id }}</td>
+            <td class="mono ellipsis" title="{{ a.run_id }}">{{ a.run_id | masked(18) }}</td>
+            <td><span class="state state-{{ 'active' if a.status == 'done' else ('pending' if a.status == 'running' else 'conflict') }}">{{ a.status | status }}</span></td>
+            <td class="num">{{ a.attempts | num }}</td>
+            <td class="mono nowrap">{{ a.started_at | localdt }}</td>
+            <td class="mono nowrap">{{ a.finished_at | localdt if a.finished_at else '—' }}</td>
+            <td class="ellipsis" title="{{ a.last_error }}">{{ a.last_error or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if not attempts %}<p class="empty">还没有重算尝试。</p>{% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
     <h2>导出</h2>
-    <p class="panel-sub">证据与清单</p>
+    <p class="panel-sub">证据与清单 · 全部取自发布基线 {{ active_batch_id or '（未发布）' }}</p>
   </div>
   <div class="panel-body">
     <div class="actions">
